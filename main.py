@@ -21,12 +21,17 @@ import torchvision.transforms as transforms
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import Subset
 
+from torch.utils.data import Dataset
+from PIL import Image
+import csv
+from torch.utils.tensorboard import SummaryWriter
+
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
     and callable(models.__dict__[name]))
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
-parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
+parser.add_argument('data', metavar='DIR', nargs='?', default='/data/bitahub/Tiny-ImageNet',
                     help='path to dataset (default: imagenet)')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     choices=model_names,
@@ -79,7 +84,31 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument('--dummy', action='store_true', help="use fake data to benchmark")
 
 best_acc1 = 0
+val_q=0
 
+class TinyImageNet(Dataset):
+    def __init__(self, val_dir, class_to_idx, transform=None):
+        self.val_dir = val_dir
+        self.transform = transform
+        self.images_dir = os.path.join(val_dir, 'images')
+        with open(os.path.join(val_dir, 'val_annotations.txt'), 'r') as f:
+            reader = csv.reader(f, delimiter='\t')
+            self.annotations = list(reader)
+        self.class_to_idx = class_to_idx
+
+    def __len__(self):
+        return len(self.annotations)
+
+    def __getitem__(self, idx):
+        img_name = os.path.join(self.images_dir, self.annotations[idx][0])
+        image = Image.open(img_name)
+        wnid = self.annotations[idx][1]
+        label = self.class_to_idx[wnid]
+        if self.transform:
+            image = self.transform(image)
+        return image, label
+
+writer = SummaryWriter('/output/logs')
 
 def main():
     args = parser.parse_args()
@@ -140,9 +169,11 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
         model = models.__dict__[args.arch](pretrained=True)
+        model.fc = nn.Linear(model.fc.in_features, 200)
     else:
         print("=> creating model '{}'".format(args.arch))
         model = models.__dict__[args.arch]()
+        model.fc = nn.Linear(model.fc.in_features, 200)
 
     if not torch.cuda.is_available() and not torch.backends.mps.is_available():
         print('using CPU, this will be slow')
@@ -236,18 +267,18 @@ def main_worker(gpu, ngpus_per_node, args):
         train_dataset = datasets.ImageFolder(
             traindir,
             transforms.Compose([
-                transforms.RandomResizedCrop(224),
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0] == 1 else x),
                 normalize,
             ]))
 
-        val_dataset = datasets.ImageFolder(
+        val_dataset = TinyImageNet(
             valdir,
+            train_dataset.class_to_idx,
             transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(224),
                 transforms.ToTensor(),
+                transforms.Lambda(lambda x: x.repeat(3, 1, 1) if x.shape[0] == 1 else x),
                 normalize,
             ]))
 
@@ -342,6 +373,9 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
 
         if i % args.print_freq == 0:
             progress.display(i + 1)
+            writer.add_scalar('Train_Loss', loss.item(), epoch * len(train_loader) + i)
+            writer.add_scalar('Train_Acc@1', acc1[0], epoch * len(train_loader) + i)
+            writer.add_scalar('Train_Acc@5', acc5[0], epoch * len(train_loader) + i)
 
 
 def validate(val_loader, model, criterion, args):
@@ -373,8 +407,14 @@ def validate(val_loader, model, criterion, args):
                 batch_time.update(time.time() - end)
                 end = time.time()
 
+                global val_q
                 if i % args.print_freq == 0:
                     progress.display(i + 1)
+                    val_q+=10
+                    writer.add_scalar('Val_Loss', loss.item(), val_q)
+                    writer.add_scalar('Val_Acc@1', acc1[0], val_q)
+                    writer.add_scalar('Val_Acc@5', acc5[0], val_q)
+                    
 
     batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
     losses = AverageMeter('Loss', ':.4e', Summary.NONE)
